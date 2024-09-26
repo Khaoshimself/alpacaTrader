@@ -22,7 +22,7 @@ class TradingBot:
         # Calculate technical indicators
         self.df['SMA_20'] = self.df['close'].rolling(window=20).mean()
         self.df['SMA_50'] = self.df['close'].rolling(window=50).mean()
-        self.df['RSI'] = calculate_rsi(self.df)  # Assuming you have an RSI function
+        self.df['RSI'] = calculate_rsi(self.df) 
         self.df['EMA_12'] = self.df['close'].ewm(span=12).mean()
         self.df['EMA_26'] = self.df['close'].ewm(span=26).mean()
         self.df['MACD'] = self.df['EMA_12'] - self.df['EMA_26']
