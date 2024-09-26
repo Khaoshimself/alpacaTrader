@@ -1,92 +1,106 @@
 import numpy as np
 from rsi import calculate_rsi
+import tensorflow as tf
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
 
 class TradingBot:
-    def __init__(self, df):
+    def __init__(self, df, lstm_model, stop_loss_percentage=0.10):
         self.df = df
-        self._prepare_data()
-        self.trades = []  # Track each buy and sell trade
-        self.total_profit = 0.0  # Track total profit
-        self.profitable_trades = 0  # Count of profitable trades
-        self.total_trades = 0  # Count of total trades
-        self.current_position = None  # Track if holding a position
-    
-    def _prepare_data(self):
-        # Calculate moving averages
+        self.lstm_model = lstm_model  # Load your trained LSTM model here
+        self.time_steps = 5
+        self._prepare_data()  # Prepare data and calculate indicators
+        self.trades = []
+        self.total_profit = 0.0
+        self.profitable_trades = 0
+        self.total_trades = 0
+        self.current_position = None
+        self.stop_loss_percentage = stop_loss_percentage
+        
+
+    def _prepare_data(self):   
+        # Calculate technical indicators
+        self.df['SMA_20'] = self.df['close'].rolling(window=20).mean()
         self.df['SMA_50'] = self.df['close'].rolling(window=50).mean()
-        self.df['SMA_200'] = self.df['close'].rolling(window=200).mean()
+        self.df['RSI'] = calculate_rsi(self.df)  # Assuming you have an RSI function
+        self.df['EMA_12'] = self.df['close'].ewm(span=12).mean()
+        self.df['EMA_26'] = self.df['close'].ewm(span=26).mean()
+        self.df['MACD'] = self.df['EMA_12'] - self.df['EMA_26']
+        self.df['MACD_signal'] = self.df['MACD'].ewm(span=9).mean()
 
-        # Calculate RSI
-        self.df['RSI'] = calculate_rsi(self.df)
+        self.df['std_20'] = self.df['close'].rolling(window=20).std()
+        self.df['Bollinger_upper'] = self.df['SMA_20'] + (self.df['std_20'] * 2)
+        self.df['Bollinger_lower'] = self.df['SMA_20'] - (self.df['std_20'] * 2)
 
-        # Initialize Signal column
-        self.df['Signal'] = 0
+        self.df['high_low'] = self.df['high'] - self.df['low']
+        self.df['high_close'] = np.abs(self.df['high'] - self.df['close'].shift())
+        self.df['low_close'] = np.abs(self.df['low'] - self.df['close'].shift())
+        self.df['true_range'] = self.df[['high_low', 'high_close', 'low_close']].max(axis=1)
+        self.df['ATR'] = self.df['true_range'].rolling(window=14).mean()
 
-        # Generate buy (1) and sell (-1) signals based on SMA crossover
-        valid_sma = self.df['SMA_50'].notna() & self.df['SMA_200'].notna()
+        self.df['14_low'] = self.df['low'].rolling(window=14).min()
+        self.df['14_high'] = self.df['high'].rolling(window=14).max()
+        self.df['Stochastic_K'] = (self.df['close'] - self.df['14_low']) / (self.df['14_high'] - self.df['14_low']) * 100
 
-        self.df.loc[valid_sma & (self.df['SMA_50'] > self.df['SMA_200']), 'Signal'] = 1  # Buy signal
-        self.df.loc[valid_sma & (self.df['SMA_50'] < self.df['SMA_200']), 'Signal'] = -1  # Sell signal
+        self.df['momentum_10'] = self.df['close'] - self.df['close'].shift(10)
 
-        # Track positions explicitly using buy (1) and sell (-1) signals
-        self.df['Position'] = 0
-        holding_position = False
+        # Drop NaN values
+        self.df = self.df.dropna()
 
-        for i in range(1, len(self.df)):
-            if self.df.iloc[i]['Signal'] == 1 and not holding_position:
-                # Buy signal: open a position
-                self.df.at[self.df.index[i], 'Position'] = 1
-                holding_position = True
-            elif self.df.iloc[i]['Signal'] == -1 and holding_position:
-                # Sell signal: close the position
-                self.df.at[self.df.index[i], 'Position'] = -1
-                holding_position = False
-            else:
-                # Maintain the current position state
-                self.df.at[self.df.index[i], 'Position'] = self.df.iloc[i - 1]['Position']
+        # Normalize features
+        X = self.df[['SMA_20', 'SMA_50', 'RSI', 'MACD', 'MACD_signal', 'Bollinger_upper', 'Bollinger_lower', 'ATR', 'Stochastic_K', 'momentum_10']]
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        X_scaled = scaler.fit_transform(X)
+
+
+         # Reshape the data for LSTM (time_steps)
+        X_lstm = np.array([X_scaled[i-self.time_steps:i] for i in range(self.time_steps, len(X_scaled))])
+
+        # Use the LSTM model to make predictions
+        lstm_predictions = self.lstm_model.predict(X_lstm)
+        lstm_predictions = [1 if p > 0.5 else 0 for p in lstm_predictions]  # Convert predictions to binary (buy/sell)
+
+        # Ensure that the number of predictions matches the number of rows after slicing
+        if len(lstm_predictions) != len(self.df) - self.time_steps:
+            raise ValueError(f"Mismatch between prediction length {len(lstm_predictions)} and DataFrame length {len(self.df) - self.time_steps}")
+
+        # Assign predictions to a new column 'LSTM_signal'
+        self.df['LSTM_signal'] = 0  # Initialize column
+        self.df.iloc[self.time_steps:, self.df.columns.get_loc('LSTM_signal')] = lstm_predictions
 
     def execute_trades(self):
-        # Execute trades and track profits
         for i, row in self.df.iterrows():
-            if row['Position'] == 1 and self.current_position is None:
-                # Buy action
+            if row['LSTM_signal'] == 1 and self.current_position is None:
+                # Buy signal from LSTM
                 self.buy(row['close'], i)
-            elif row['Position'] == -1 and self.current_position is not None:
-                # Sell action
+            elif row['LSTM_signal'] == 0 and self.current_position is not None:
+                # Sell signal from LSTM
                 self.sell(row['close'], i)
+            elif self.current_position is not None:
+                # Stop-loss check
+                if row['close'] < self.current_position['stop_loss_price']:
+                    self.sell(row['close'], i)
 
-        # At the end of execution, show the summary
         self.summary()
 
     def buy(self, price, timestamp):
-        # Record the buy trade
-        self.current_position = {'price': price, 'timestamp': timestamp}
+        stop_loss_price = price * (1 - self.stop_loss_percentage)
+        self.current_position = {'price': price, 'stop_loss_price': stop_loss_price, 'timestamp': timestamp}
         self.trades.append({'action': 'buy', 'price': price, 'timestamp': timestamp})
-        print(f"Buy at {price} on {timestamp}")
+        print(f"Bought at {price} on {timestamp}, stop-loss set at {stop_loss_price}")
 
     def sell(self, price, timestamp):
-        # Sell action, calculate profit based on the previous buy price
         if self.current_position:
             buy_price = self.current_position['price']
             profit = price - buy_price
             self.total_profit += profit
             self.total_trades += 1
-
-            # Determine if the trade was profitable
             if profit > 0:
                 self.profitable_trades += 1
-
-            # Log the sell trade and remove the current position
             self.trades.append({'action': 'sell', 'price': price, 'timestamp': timestamp})
-            print(f"Sell at {price} on {timestamp}, Profit: {profit:.2f}")
+            print(f"Sold at {price} on {timestamp}, profit: {profit:.2f}")
             self.current_position = None
 
     def summary(self):
-        # Calculate accuracy
         accuracy = (self.profitable_trades / self.total_trades) * 100 if self.total_trades > 0 else 0
-        print(f"Total Profit: {self.total_profit:.2f}")
-        print(f"Accuracy: {accuracy:.2f}%")
-
-    def print_signals(self):
-        print(self.df[['close', 'SMA_50', 'SMA_200', 'RSI', 'Signal', 'Position']])
-
+        print(f"Total profit: {self.total_profit:.2f}, accuracy: {accuracy:.2f}%")
