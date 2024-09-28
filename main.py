@@ -1,4 +1,4 @@
-from config import api_key, secret_key
+from config import api_key, secret_key, db_config
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -37,7 +37,7 @@ def main():
     lstm_model = load_model('lstm_trading_model.keras')
     
     # Initialize the TradingBot with data and the loaded LSTM model
-    bot = TradingBot(df, lstm_model)
+    bot = TradingBot(df, lstm_model, db_config=db_config)
     
     # Execute trades
     bot.execute_trades()

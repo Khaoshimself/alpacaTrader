@@ -3,9 +3,13 @@ from rsi import calculate_rsi
 import tensorflow as tf
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
+from datetime import datetime
+import mysql.connector
+
+
 
 class TradingBot:
-    def __init__(self, df, lstm_model, stop_loss_percentage=0.10):
+    def __init__(self, df, lstm_model, stop_loss_percentage=0.10, db_config=None):
         self.df = df
         self.lstm_model = lstm_model  # Load your trained LSTM model here
         self.time_steps = 5
@@ -16,13 +20,25 @@ class TradingBot:
         self.total_trades = 0
         self.current_position = None
         self.stop_loss_percentage = stop_loss_percentage
-        
 
+        #Set up MySQL connection
+        if db_config:
+            self.db = mysql.connector.connect(**db_config)
+            self.cursor = self.db.cursor()
+
+    def log_trade(self, action, price, timestamp, stop_loss_price=None, profit=None):
+        trade_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        insert_trade = ("INSERT INTO trades (action, price, timestamp, stop_loss_price, profit) "
+                        "VALUES (%s, %s, %s, %s, %s)")
+        trade_data = (action, price, trade_time, stop_loss_price, profit)
+        self.cursor.execute(insert_trade, trade_data)
+        self.db.commit()
+        
     def _prepare_data(self):   
         # Calculate technical indicators
         self.df['SMA_20'] = self.df['close'].rolling(window=20).mean()
         self.df['SMA_50'] = self.df['close'].rolling(window=50).mean()
-        self.df['RSI'] = calculate_rsi(self.df)  # Assuming you have an RSI function
+        self.df['RSI'] = calculate_rsi(self.df) 
         self.df['EMA_12'] = self.df['close'].ewm(span=12).mean()
         self.df['EMA_26'] = self.df['close'].ewm(span=26).mean()
         self.df['MACD'] = self.df['EMA_12'] - self.df['EMA_26']
@@ -51,7 +67,6 @@ class TradingBot:
         X = self.df[['SMA_20', 'SMA_50', 'RSI', 'MACD', 'MACD_signal', 'Bollinger_upper', 'Bollinger_lower', 'ATR', 'Stochastic_K', 'momentum_10']]
         scaler = MinMaxScaler(feature_range=(0, 1))
         X_scaled = scaler.fit_transform(X)
-
 
          # Reshape the data for LSTM (time_steps)
         X_lstm = np.array([X_scaled[i-self.time_steps:i] for i in range(self.time_steps, len(X_scaled))])
@@ -84,10 +99,17 @@ class TradingBot:
         self.summary()
 
     def buy(self, price, timestamp):
-        stop_loss_price = price * (1 - self.stop_loss_percentage)
+        # Dynamic stop-loss based on ATR or Bollinger Bands
+        atr_stop_loss = self.df.loc[timestamp, 'ATR']
+        bollinger_stop_loss = self.df.loc[timestamp, 'Bollinger_lower']
+        stop_loss_price = min(price * (1 - self.stop_loss_percentage), bollinger_stop_loss, atr_stop_loss)
+
         self.current_position = {'price': price, 'stop_loss_price': stop_loss_price, 'timestamp': timestamp}
         self.trades.append({'action': 'buy', 'price': price, 'timestamp': timestamp})
         print(f"Bought at {price} on {timestamp}, stop-loss set at {stop_loss_price}")
+
+        #Log the buy trade
+        self.log_trade(action='buy', price=price, timestamp=timestamp, stop_loss_price=stop_loss_price)
 
     def sell(self, price, timestamp):
         if self.current_position:
@@ -101,6 +123,11 @@ class TradingBot:
             print(f"Sold at {price} on {timestamp}, profit: {profit:.2f}")
             self.current_position = None
 
+            # Log the sell trade
+            self.log_trade(action='sell', price=price, timestamp=timestamp, profit=profit)
+
+
     def summary(self):
         accuracy = (self.profitable_trades / self.total_trades) * 100 if self.total_trades > 0 else 0
         print(f"Total profit: {self.total_profit:.2f}, accuracy: {accuracy:.2f}%")
+        
